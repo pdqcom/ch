@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `:external` query option and `Ch.ExternalTable` to send [external data](https://clickhouse.com/docs/engines/table-engines/special/external-data) with queries, e.g. to filter by millions of ids.
+
 ## 0.7.3 (2026-05-06)
 
 - use scientific decimals rendering in params https://github.com/plausible/ch/pull/333
