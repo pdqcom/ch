@@ -1,6 +1,6 @@
 defmodule Ch.Query do
   @moduledoc "Query struct wrapping the SQL statement."
-  defstruct [:statement, :command, :encode, :decode, :multipart]
+  defstruct [:statement, :command, :encode, :decode, :multipart, external: []]
 
   @typedoc """
   The Query struct.
@@ -11,14 +11,17 @@ defmodule Ch.Query do
     * `:command` - The detected or enforced SQL command type (e.g., `:select`, `:insert`).
     * `:encode` - Whether to encode parameters (defaults to `true`).
     * `:decode` - Whether to decode the response (defaults to `true`).
-    * `:multipart` - Whether to use `multipart/form-data` for the request (defaults to `false`).
+    * `:multipart` - Whether to use `multipart/form-data` for the request (defaults to `false`,
+      or `true` when `:external` is not empty).
+    * `:external` - External tables sent with the query (defaults to `[]`), see `Ch.ExternalTable`.
   """
   @type t :: %__MODULE__{
           statement: iodata,
           command: command,
           encode: boolean,
           decode: boolean,
-          multipart: boolean
+          multipart: boolean,
+          external: [Ch.ExternalTable.t()]
         }
 
   @doc false
@@ -27,14 +30,35 @@ defmodule Ch.Query do
     command = Keyword.get(opts, :command) || extract_command(statement)
     encode = Keyword.get(opts, :encode, true)
     decode = Keyword.get(opts, :decode, true)
-    multipart = Keyword.get(opts, :multipart, false)
+    external = Keyword.get(opts, :external) || []
+
+    unless is_list(external) and Enum.all?(external, &is_struct(&1, Ch.ExternalTable)) do
+      raise ArgumentError,
+            "expected :external to be a list of Ch.ExternalTable structs, " <>
+              "got: #{inspect(external)}"
+    end
+
+    multipart =
+      case {external, Keyword.get(opts, :multipart)} do
+        {[], multipart} ->
+          multipart || false
+
+        {_external, false} ->
+          raise ArgumentError,
+                "external tables are sent in a multipart/form-data body " <>
+                  "and can't be used with `multipart: false`"
+
+        {_external, _multipart} ->
+          true
+      end
 
     %__MODULE__{
       statement: statement,
       command: command,
       encode: encode,
       decode: decode,
-      multipart: multipart
+      multipart: multipart,
+      external: external
     }
   end
 
@@ -116,6 +140,7 @@ defimpl DBConnection.Query, for: Ch.Query do
   @spec encode(Query.t(), {:stream, term}, [Ch.query_option()]) ::
           {:stream, {[{String.t(), String.t()}], Mint.Types.headers(), iodata}}
   def encode(query, {:stream, params}, opts) do
+    ensure_no_external!(query)
     {:stream, encode(query, params, opts)}
   end
 
@@ -132,7 +157,9 @@ defimpl DBConnection.Query, for: Ch.Query do
              query_params: [{String.t(), String.t()}],
              body: iodata | Enumerable.t()
 
-  def encode(%Query{command: :insert, encode: false, statement: statement}, data, opts) do
+  def encode(%Query{command: :insert, encode: false, statement: statement} = query, data, opts) do
+    ensure_no_external!(query)
+
     body =
       case data do
         _ when is_list(data) or is_binary(data) -> [statement, ?\n | data]
@@ -142,25 +169,51 @@ defimpl DBConnection.Query, for: Ch.Query do
     {_query_params = [], headers(opts), body}
   end
 
-  def encode(%Query{command: :insert, statement: statement}, params, opts) do
+  def encode(%Query{command: :insert, statement: statement} = query, params, opts) do
     cond do
       names = Keyword.get(opts, :names) ->
+        ensure_no_external!(query)
         types = Keyword.fetch!(opts, :types)
         header = RowBinary.encode_names_and_types(names, types)
         data = RowBinary.encode_rows(params, types)
         {_query_params = [], headers(opts), [statement, ?\n, header | data]}
 
       format_row_binary?(statement) ->
+        ensure_no_external!(query)
         types = Keyword.fetch!(opts, :types)
         data = RowBinary.encode_rows(params, types)
         {_query_params = [], headers(opts), [statement, ?\n | data]}
+
+      # e.g. INSERT ... SELECT from an external table
+      query.external != [] ->
+        encode_multipart(query, params, opts)
 
       true ->
         {query_params(params), headers(opts), statement}
     end
   end
 
-  def encode(%Query{multipart: true, statement: statement}, params, opts) do
+  def encode(%Query{multipart: true} = query, params, opts) do
+    encode_multipart(query, params, opts)
+  end
+
+  def encode(%Query{statement: statement}, params, opts) do
+    types = Keyword.get(opts, :types)
+    default_format = if types, do: "RowBinary", else: "RowBinaryWithNamesAndTypes"
+    format = Keyword.get(opts, :format) || default_format
+    {query_params(params), [{"x-clickhouse-format", format} | headers(opts)], statement}
+  end
+
+  # The request body is either the INSERT data or the multipart form with external tables.
+  defp ensure_no_external!(%Query{external: []}), do: :ok
+
+  defp ensure_no_external!(%Query{}) do
+    raise ArgumentError,
+          "external tables can't be sent with INSERT data, " <>
+            "use INSERT ... SELECT from an external table instead"
+  end
+
+  defp encode_multipart(%Query{statement: statement, external: external}, params, opts) do
     types = Keyword.get(opts, :types)
     default_format = if types, do: "RowBinary", else: "RowBinaryWithNamesAndTypes"
     format = Keyword.get(opts, :format) || default_format
@@ -170,17 +223,18 @@ defimpl DBConnection.Query, for: Ch.Query do
     enc_boundary = "--#{boundary}\r\n"
     multipart = multipart_params(params, enc_boundary)
     multipart = add_multipart_part(multipart, "query", statement, enc_boundary)
-    multipart = [multipart | "--#{boundary}--\r\n"]
+    multipart = multipart_external(external, enc_boundary, multipart, "--#{boundary}--\r\n")
 
-    {_no_query_params = [],
-     [{"x-clickhouse-format", format}, {"content-type", content_type} | headers(opts)], multipart}
+    headers = [{"x-clickhouse-format", format}, {"content-type", content_type} | headers(opts)]
+
+    query_params = Enum.flat_map(external, &Ch.ExternalTable.query_params/1)
+
+    {query_params, headers, multipart}
   end
 
-  def encode(%Query{statement: statement}, params, opts) do
-    types = Keyword.get(opts, :types)
-    default_format = if types, do: "RowBinary", else: "RowBinaryWithNamesAndTypes"
-    format = Keyword.get(opts, :format) || default_format
-    {query_params(params), [{"x-clickhouse-format", format} | headers(opts)], statement}
+  defp multipart_external(tables, boundary, multipart, closing) do
+    parts = Enum.map(tables, &Ch.ExternalTable.multipart_part(&1, boundary))
+    [multipart, parts | closing]
   end
 
   defp multipart_params(params, boundary) when is_map(params) do

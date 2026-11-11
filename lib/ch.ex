@@ -66,6 +66,10 @@ defmodule Ch do
   * `:format` - Custom response format for the request
   * `:decode` - Whether to automatically decode the response
   * `:multipart` - Whether to send the query as multipart/form-data
+  * `:external` - A list of `Ch.ExternalTable` structs to send with the query as
+    [external data](https://clickhouse.com/docs/engines/table-engines/special/external-data).
+    Each table can be used in the query under its name, and hides a real table with the
+    same name. Implies `multipart: true` and raises `ArgumentError` with `multipart: false`
   """
   @type query_option ::
           common_option
@@ -77,6 +81,7 @@ defmodule Ch do
           | {:encode, boolean}
           | {:decode, boolean}
           | {:multipart, boolean}
+          | {:external, [Ch.ExternalTable.t()]}
           | DBConnection.connection_option()
 
   @doc """
