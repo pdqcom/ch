@@ -227,31 +227,13 @@ defimpl DBConnection.Query, for: Ch.Query do
 
     headers = [{"x-clickhouse-format", format}, {"content-type", content_type} | headers(opts)]
 
-    query_params =
-      Enum.flat_map(external, fn %Ch.ExternalTable{name: name} = table ->
-        [{name <> "_structure", table.structure}, {name <> "_format", table.format}]
-      end)
+    query_params = Enum.flat_map(external, &Ch.ExternalTable.query_params/1)
 
     {query_params, headers, multipart}
   end
 
-  # Adds external tables as file parts, the filename is what makes ClickHouse treat a part
-  # as a table rather than a parameter.
   defp multipart_external(tables, boundary, multipart, closing) do
-    parts =
-      Enum.map(tables, fn %Ch.ExternalTable{name: name, data: data} ->
-        [
-          boundary,
-          "content-disposition: form-data; name=\"",
-          name,
-          "\"; filename=\"",
-          name,
-          "\"\r\n\r\n",
-          data,
-          "\r\n"
-        ]
-      end)
-
+    parts = Enum.map(tables, &Ch.ExternalTable.multipart_part(&1, boundary))
     [multipart, parts | closing]
   end
 

@@ -41,21 +41,14 @@ defmodule Ch.ExternalTable do
   defstruct [:name, :structure, :format, :data]
 
   @typedoc """
-  An external table.
-
-  ## Fields
-
-    * `:name` - The table name used in the query.
-    * `:structure` - The table structure, e.g. `"id UInt64, name String"`.
-    * `:format` - The ClickHouse format of `:data`, e.g. `"RowBinary"` or `"CSV"`.
-    * `:data` - The encoded table data.
+  An external table, built with `new/3` or `raw/4`.
   """
-  @type t :: %__MODULE__{
-          name: String.t(),
-          structure: String.t(),
-          format: String.t(),
-          data: iodata
-        }
+  @opaque t :: %__MODULE__{
+            name: String.t(),
+            structure: String.t(),
+            format: String.t(),
+            data: iodata
+          }
 
   @doc """
   Builds an external table from rows, encoded with `Ch.RowBinary`.
@@ -102,6 +95,28 @@ defmodule Ch.ExternalTable do
   def raw(name, structure, format, data)
       when is_binary(structure) and is_binary(format) and (is_binary(data) or is_list(data)) do
     %__MODULE__{name: validate_name!(name), structure: structure, format: format, data: data}
+  end
+
+  @doc false
+  @spec query_params(t) :: [{String.t(), String.t()}]
+  def query_params(%__MODULE__{name: name, structure: structure, format: format}) do
+    [{name <> "_structure", structure}, {name <> "_format", format}]
+  end
+
+  # The filename is what makes ClickHouse treat a part as a table rather than a parameter.
+  @doc false
+  @spec multipart_part(t, iodata) :: iodata
+  def multipart_part(%__MODULE__{name: name, data: data}, boundary) do
+    [
+      boundary,
+      "content-disposition: form-data; name=\"",
+      name,
+      "\"; filename=\"",
+      name,
+      "\"\r\n\r\n",
+      data,
+      "\r\n"
+    ]
   end
 
   defp column_definition({name, type}) do
